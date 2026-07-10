@@ -1,0 +1,9 @@
+.venv/
+*.egg-info/
+build/
+dist/
+__pycache__/
+*.pyc
+.DS_Store
+*.log
+logwatch_test_output.txt

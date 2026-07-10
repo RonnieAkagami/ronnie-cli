@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ronnie"
+version = "1.0.0"
+description = "Ronnie - Local Agentic Coding Partner"
+requires-python = ">=3.9"
+dependencies = [
+    "rich>=10.0.0",
+    "ollama>=0.2.0",
+]
+
+[project.scripts]
+ronnie = "ronnie:main"
+
+[tool.setuptools]
+py-modules = ["ronnie"]
