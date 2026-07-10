@@ -18,6 +18,7 @@ try:
     from rich.syntax import Syntax
     from rich.prompt import Prompt
     from rich.theme import Theme
+    from rich.markdown import Markdown
 except ImportError as e:
     print(f"Missing required dependency: {e}")
     print("Please run: pip install rich ollama")
@@ -429,32 +430,33 @@ def run_agentic_loop(messages: List[Dict[str, str]], client: ollama.Client) -> b
             )
             
             # Print chunks as they stream, hiding raw XML tool calls for speed & clean terminal UI
-            printed_len = 0
             in_tool_call = False
-            for chunk in stream:
-                content = chunk.get('message', {}).get('content', '') or ''
-                if not content:
-                    continue
-                response_text += content
-                
-                if not in_tool_call:
+            stream_iterator = iter(stream)
+            
+            with Live("", refresh_per_second=10, console=console) as live:
+                for chunk in stream_iterator:
+                    content = chunk.get('message', {}).get('content', '') or ''
+                    if not content:
+                        continue
+                    response_text += content
+                    
                     tool_call_start = response_text.find("<tool_call")
                     if tool_call_start != -1:
-                        to_print = response_text[printed_len:tool_call_start]
-                        if to_print:
-                            print(to_print, end="", flush=True)
-                            printed_len += len(to_print)
                         in_tool_call = True
-                        console.print("\n[info]⚙️  Formulating tool call(s)...[/info]", end="")
+                        non_tool_text = response_text[:tool_call_start].strip()
+                        live.update(Markdown(non_tool_text))
+                        break
                     else:
-                        to_print = response_text[printed_len:]
-                        print(to_print, end="", flush=True)
-                        printed_len += len(to_print)
-                else:
-                    # Print subtle progress indicators without flooding the terminal
+                        live.update(Markdown(response_text.strip()))
+            
+            if in_tool_call:
+                console.print("[info]⚙️  Formulating tool call(s)...[/info]", end="")
+                for chunk in stream_iterator:
+                    content = chunk.get('message', {}).get('content', '') or ''
+                    response_text += content
                     if len(response_text) % 80 == 0:
                         print(".", end="", flush=True)
-            print()
+                print()
             
         except Exception as e:
             console.print(f"\n[danger]Ollama error:[/danger] {e}")
