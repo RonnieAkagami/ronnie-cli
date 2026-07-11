@@ -7,3 +7,5 @@ __pycache__/
 .DS_Store
 *.log
 logwatch_test_output.txt
+ronnie.egg-info/
+
