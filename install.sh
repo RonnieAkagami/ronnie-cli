@@ -36,14 +36,27 @@ else
     fi
 fi
 
-# 4. Install dependencies (rich, ollama) globally or for the user
-echo "[*] Installing pip dependencies (rich, ollama)..."
-if python3 -m pip install --upgrade rich ollama --break-system-packages 2>/dev/null; then
-    echo "[+] Dependencies installed globally."
-elif python3 -m pip install --upgrade rich ollama --user 2>/dev/null; then
-    echo "[+] Dependencies installed in user space."
+# 4. Install the package and dependencies (rich, ollama) globally or for the user
+echo "[*] Installing Ronnie package and dependencies..."
+if [ -f "ronnie.py" ]; then
+    # Local install
+    if python3 -m pip install --upgrade . --break-system-packages 2>/dev/null; then
+        echo "[+] Package and dependencies installed globally."
+    elif python3 -m pip install --upgrade . --user 2>/dev/null; then
+        echo "[+] Package and dependencies installed in user space."
+    else
+        echo "[!] Warning: Failed to install package via pip. You may need to run 'pip install .' manually."
+    fi
 else
-    echo "[!] Warning: Failed to install dependencies via pip. You may need to run 'pip install rich ollama' manually."
+    # Remote install from Git archive (does not require git binary)
+    SRC_ZIP="https://github.com/RonnieAkagami/ronnie-cli/archive/refs/heads/main.zip"
+    if python3 -m pip install --upgrade "$SRC_ZIP" --break-system-packages 2>/dev/null; then
+        echo "[+] Package and dependencies installed globally from GitHub."
+    elif python3 -m pip install --upgrade "$SRC_ZIP" --user 2>/dev/null; then
+        echo "[+] Package and dependencies installed in user space from GitHub."
+    else
+        echo "[!] Warning: Failed to install package via pip. You may need to run 'pip install' manually."
+    fi
 fi
 
 # 5. Move script to global binary directory and make executable
