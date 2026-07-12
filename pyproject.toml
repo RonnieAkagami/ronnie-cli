@@ -13,7 +13,7 @@ dependencies = [
 ]
 
 [project.scripts]
-ronnie = "ronnie:main"
+ronnie = "ronnie.cli:main"
 
 [tool.setuptools]
-py-modules = ["ronnie"]
+packages = ["ronnie"]
