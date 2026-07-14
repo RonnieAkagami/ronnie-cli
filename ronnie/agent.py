@@ -1,6 +1,9 @@
 import os
 import re
 import difflib
+import time
+import random
+import threading
 from typing import List, Dict, Any
 import ollama
 
@@ -9,6 +12,7 @@ from rich.text import Text
 from rich.live import Live
 from rich.prompt import Prompt
 from rich.markdown import Markdown
+from rich.spinner import Spinner
 
 from ronnie.config import console, MODEL_NAME
 from ronnie.tools import list_dir, view_file, write_file, edit_file, grep_search, run_command
@@ -169,29 +173,76 @@ def run_agentic_loop(messages: List[Dict[str, str]], client: ollama.Client) -> b
     always_approve = False
     
     while True:
-        console.print("\n🤖 [bold bright_magenta]Ronnie Thinking...[/bold bright_magenta]")
         response_text = ""
         
         try:
-            # Stream the completion from Ollama
-            # Disable thinking mode for speed — ornith:9b supports it but it causes
-            # very long prefill delays for complex prompts
-            stream = client.chat(
-                model=MODEL_NAME,
-                messages=messages,
-                stream=True,
-                think=False
-            )
+            # Dynamic thinking synonyms
+            THINKING_SYNONYMS = [
+                "Pondering",
+                "Analyzing",
+                "Synthesizing",
+                "Reflecting",
+                "Deliberating",
+                "Contemplating",
+                "Musing",
+                "Evaluating",
+                "Deciphering",
+                "Formulating",
+                "Processing",
+                "Cogitating"
+            ]
+            current_synonym = random.choice(THINKING_SYNONYMS)
+            thinking = True
             
-            # Print chunks as they stream, hiding raw XML tool calls for speed & clean terminal UI
-            in_tool_call = False
-            stream_iterator = iter(stream)
+            initial_spinner = Spinner("dots", text=Text(f" {current_synonym}...", style="bold bright_magenta"))
             
-            with Live("", refresh_per_second=10, console=console) as live:
+            console.print()
+            with Live(initial_spinner, refresh_per_second=10, console=console) as live:
+                # Background thread to cycle synonyms every 5 seconds
+                def update_spinner():
+                    nonlocal current_synonym
+                    start_time = time.time()
+                    while thinking:
+                        elapsed = time.time() - start_time
+                        if elapsed >= 5.0:
+                            remaining = [s for s in THINKING_SYNONYMS if s != current_synonym]
+                            current_synonym = random.choice(remaining) if remaining else current_synonym
+                            start_time = time.time()
+                        
+                        live.update(Spinner("dots", text=Text(f" {current_synonym}...", style="bold bright_magenta")))
+                        time.sleep(0.1)
+
+                t = threading.Thread(target=update_spinner, daemon=True)
+                t.start()
+                
+                try:
+                    # Stream the completion from Ollama
+                    # Disable thinking mode for speed — ornith:9b supports it but it causes
+                    # very long prefill delays for complex prompts
+                    stream = client.chat(
+                        model=MODEL_NAME,
+                        messages=messages,
+                        stream=True,
+                        think=False
+                    )
+                    stream_iterator = iter(stream)
+                except Exception as e:
+                    thinking = False
+                    t.join(timeout=1.0)
+                    raise e
+                
+                # Print chunks as they stream, hiding raw XML tool calls for speed & clean terminal UI
+                in_tool_call = False
+                
                 for chunk in stream_iterator:
                     content = chunk.get('message', {}).get('content', '') or ''
                     if not content:
                         continue
+                    
+                    if thinking:
+                        thinking = False
+                        t.join(timeout=1.0)
+                        
                     response_text += content
                     
                     tool_call_start = response_text.find("<tool_call")
@@ -202,6 +253,10 @@ def run_agentic_loop(messages: List[Dict[str, str]], client: ollama.Client) -> b
                         break
                     else:
                         live.update(Markdown(response_text.strip()))
+                        
+                if thinking:
+                    thinking = False
+                    t.join(timeout=1.0)
             
             if in_tool_call:
                 console.print("[info]⚙️  Formulating tool call(s)...[/info]", end="")
