@@ -9,4 +9,8 @@ else
     python3 -m pip install .
 fi
 chmod +x ronnie.py
+# Write local commit hash to ~/.ronnie_commit if in git repo
+if command -v git &> /dev/null && git rev-parse --is-inside-work-tree &> /dev/null; then
+    git rev-parse HEAD > ~/.ronnie_commit 2>/dev/null
+fi
 echo "[*] Installation completed! You can now run 'ronnie' in any directory."

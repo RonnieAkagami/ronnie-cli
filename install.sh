@@ -62,6 +62,13 @@ fi
 # 5. Move script to global binary directory and make executable
 echo "[*] Installing executable to $TARGET (may prompt for sudo password)..."
 if sudo mv "$TEMP_FILE" "$TARGET" && sudo chmod +x "$TARGET"; then
+    # 6. Save current commit hash to avoid redundant update on first run
+    echo "[*] Saving current commit hash to ~/.ronnie_commit..."
+    REMOTE_SHA=$(curl -s "https://github.com/RonnieAkagami/ronnie-cli.git/info/refs?service=git-upload-pack" | grep -oE '[0-9a-fA-F]{40}' | head -n 1)
+    if [ ! -z "$REMOTE_SHA" ]; then
+        echo "$REMOTE_SHA" > ~/.ronnie_commit
+    fi
+
     echo "========================================="
     echo "[+] Installation Successful!"
     echo "========================================="

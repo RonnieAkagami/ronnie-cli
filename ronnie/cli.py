@@ -29,7 +29,107 @@ def save_history():
 
 atexit.register(save_history)
 
+def check_and_update():
+    # Avoid auto-updating when running in local development mode or when explicitly disabled
+    is_dev = (
+        os.environ.get("RONNIE_NO_AUTO_UPDATE") == "1"
+        or os.environ.get("RONNIE_DEV") == "1"
+        or os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "setup.py"))
+    )
+    if is_dev:
+        return
+
+    commit_file = os.path.expanduser("~/.ronnie_commit")
+    
+    # 1. Fetch remote commit SHA
+    remote_sha = None
+    url = "https://github.com/RonnieAkagami/ronnie-cli.git/info/refs?service=git-upload-pack"
+    try:
+        import urllib.request
+        import re
+        req = urllib.request.Request(
+            url,
+            headers={'User-Agent': 'Mozilla/5.0'}
+        )
+        with urllib.request.urlopen(req, timeout=1.2) as response:
+            content = response.read().decode('utf-8', errors='ignore')
+            match = re.search(r'([0-9a-fA-F]{40})\s+refs/heads/main', content)
+            if match:
+                remote_sha = match.group(1)
+    except Exception:
+        return
+
+    if not remote_sha:
+        return
+
+    # 2. Check local commit SHA
+    local_sha = None
+    if os.path.exists(commit_file):
+        try:
+            with open(commit_file, "r") as f:
+                local_sha = f.read().strip()
+        except Exception:
+            pass
+
+    # 3. If remote commit is different, update
+    if remote_sha != local_sha:
+        console.print(f"[info][*] New update found! Updating Ronnie CLI to latest version ({remote_sha[:7]})...[/info]")
+        
+        import subprocess
+        zip_url = "https://github.com/RonnieAkagami/ronnie-cli/archive/refs/heads/main.zip"
+        
+        success = False
+        options_list = [
+            ["install", "--upgrade", zip_url],
+            ["install", "--upgrade", zip_url, "--break-system-packages"],
+            ["install", "--upgrade", zip_url, "--user"],
+            ["install", "--upgrade", zip_url, "--user", "--break-system-packages"]
+        ]
+        
+        for opts in options_list:
+            try:
+                res = subprocess.run([sys.executable, "-m", "pip"] + opts, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                if res.returncode == 0:
+                    success = True
+                    break
+            except Exception:
+                continue
+
+        if success:
+            try:
+                with open(commit_file, "w") as f:
+                    f.write(remote_sha)
+            except Exception:
+                pass
+                
+            # Try to update the executable itself if it's writable
+            exe_path = sys.argv[0]
+            if os.path.exists(exe_path) and os.access(exe_path, os.W_OK):
+                try:
+                    raw_url = "https://raw.githubusercontent.com/RonnieAkagami/ronnie-cli/main/ronnie.py"
+                    with urllib.request.urlopen(raw_url, timeout=1.2) as resp:
+                        new_code = resp.read()
+                        if new_code:
+                            with open(exe_path, 'wb') as f:
+                                f.write(new_code)
+                except Exception:
+                    pass
+                    
+            console.print(f"[success][+] Ronnie CLI updated successfully. Restarting...[/success]\n")
+            
+            # Restart the process
+            try:
+                os.execvp(sys.argv[0], sys.argv)
+            except Exception:
+                try:
+                    os.execv(sys.executable, [sys.executable] + sys.argv)
+                except Exception:
+                    sys.exit(0)
+        else:
+            console.print("[warning][!] Failed to update Ronnie CLI automatically. Skipping update...[/warning]")
+
 def main():
+    check_and_update()
     # Setup client
     client = ollama.Client()
     try:
