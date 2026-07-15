@@ -1,10 +1,15 @@
+"""Core agentic loop — streams model output, parses tool calls, executes them."""
+
+from __future__ import annotations
+
 import os
 import re
 import difflib
 import time
 import random
 import threading
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
+
 import ollama
 
 from rich.panel import Panel
@@ -14,293 +19,420 @@ from rich.prompt import Prompt
 from rich.markdown import Markdown
 from rich.spinner import Spinner
 
-from ronnie.config import console, MODEL_NAME
+from ronnie.config import (
+    console,
+    MODEL_NAME,
+    MAX_ITERATIONS,
+    CONTEXT_MAX_MESSAGES,
+    MAX_TOOL_OUTPUT_CHARS,
+)
 from ronnie.tools import list_dir, view_file, write_file, edit_file, grep_search, run_command
 
+
+# ---------------------------------------------------------------------------
+# XML tool-call parser
+# ---------------------------------------------------------------------------
+
 def parse_tool_calls(text: str) -> List[Dict[str, Any]]:
-    # Capture everything within <tool_call name="...">...</tool_call>
-    tool_call_pattern = re.compile(r"<tool_call\s+name=\"([^\"]+)\"\s*>(.*?)</tool_call>", re.DOTALL)
-    calls = []
-    
+    """Extract ``<tool_call name="…">…</tool_call>`` blocks from *text*.
+
+    Uses greedy matching for ``content``, ``search``, and ``replace`` tags to
+    handle code containing angle brackets (``x < 5``, ``</div>``, etc.).
+    """
+    tool_call_pattern = re.compile(
+        r"<tool_call\s+name=\"([^\"]+)\"\s*>(.*?)</tool_call>", re.DOTALL
+    )
+    calls: list[dict[str, Any]] = []
+
     for match in tool_call_pattern.finditer(text):
         tool_name = match.group(1)
         body = match.group(2)
-        
-        args = {}
-        # For content/search/replace tags, use GREEDY match to handle code with
-        # angle brackets (e.g. `x < 5`, `</div>`, etc.) inside the tag body.
-        # For other short params (path, cmd, pattern), use non-greedy.
-        for tag_name in ('content', 'search', 'replace'):
-            tag_pattern = re.compile(rf"<{tag_name}>(.*)</{tag_name}>", re.DOTALL)
-            tag_match = tag_pattern.search(body)
-            if tag_match:
-                args[tag_name] = tag_match.group(1)
-        
-        # Parse remaining simple parameter tags with non-greedy match
-        simple_pattern = re.compile(r"<([a-zA-Z0-9_]+)>(.*?)</\1>", re.DOTALL)
-        for p_match in simple_pattern.finditer(body):
-            param_name = p_match.group(1)
-            if param_name in args:  # Already parsed with greedy match
-                continue
-            args[param_name] = p_match.group(2).strip()
-            
-        calls.append({
-            "name": tool_name,
-            "args": args,
-            "raw": match.group(0)
-        })
+        args: dict[str, str] = {}
+
+        # Greedy match for large-body tags (content/search/replace).
+        for tag in ("content", "search", "replace"):
+            tag_re = re.compile(rf"<{tag}>(.*)</{tag}>", re.DOTALL)
+            m = tag_re.search(body)
+            if m:
+                args[tag] = m.group(1)
+
+        # Non-greedy match for short parameter tags.
+        simple_re = re.compile(r"<([a-zA-Z0-9_]+)>(.*?)</\1>", re.DOTALL)
+        for m in simple_re.finditer(body):
+            pname = m.group(1)
+            if pname not in args:  # don't overwrite greedy matches
+                args[pname] = m.group(2).strip()
+
+        calls.append({"name": tool_name, "args": args, "raw": match.group(0)})
+
     return calls
 
+
+# ---------------------------------------------------------------------------
+# Diff helper
+# ---------------------------------------------------------------------------
+
 def get_diff(old_text: str, new_text: str, filename: str) -> Text:
+    """Generate a coloured unified diff."""
     diff = difflib.unified_diff(
         old_text.splitlines(keepends=True),
         new_text.splitlines(keepends=True),
         fromfile=f"a/{filename}",
         tofile=f"b/{filename}",
-        n=3
+        n=3,
     )
-    diff_text = Text()
+    result = Text()
     for line in diff:
-        if line.startswith('+') and not line.startswith('+++'):
-            diff_text.append(line, style="green")
-        elif line.startswith('-') and not line.startswith('---'):
-            diff_text.append(line, style="red")
-        elif line.startswith('@@'):
-            diff_text.append(line, style="cyan")
+        if line.startswith("+") and not line.startswith("+++"):
+            result.append(line, style="green")
+        elif line.startswith("-") and not line.startswith("---"):
+            result.append(line, style="red")
+        elif line.startswith("@@"):
+            result.append(line, style="cyan")
         else:
-            diff_text.append(line, style="dim")
-    return diff_text
+            result.append(line, style="dim")
+    return result
 
-def execute_tool(name: str, args: Dict[str, Any], always_approve: bool) -> tuple[str, bool]:
+
+# ---------------------------------------------------------------------------
+# Tool execution
+# ---------------------------------------------------------------------------
+
+def execute_tool(
+    name: str,
+    args: Dict[str, Any],
+    always_approve: bool,
+) -> Tuple[str, bool, bool]:
+    """Execute a single tool call.
+
+    Returns ``(response_xml, should_cancel, always_approve)``.
+    The third element propagates the "always" approval choice back to the loop.
     """
-    Executes a tool call. Returns a tuple (response_text, should_cancel).
-    """
-    is_modifying = name in ('write_file', 'edit_file', 'run_command')
-    
-    # Validate required arguments
-    if name in ('write_file', 'edit_file', 'view_file') and not args.get('path'):
-        return f'<tool_response name="{name}"><status>error</status><message>Error: Missing required "path" argument. The XML parser could not extract it — the model may have generated malformed XML.</message></tool_response>', False
-    if name == 'run_command' and not args.get('cmd'):
-        return f'<tool_response name="{name}"><status>error</status><message>Error: Missing required "cmd" argument.</message></tool_response>', False
-    
-    # Prompt for confirmation if necessary
+    is_modifying = name in ("write_file", "edit_file", "run_command")
+
+    # ------ Validate required args ------
+    if name in ("write_file", "edit_file", "view_file") and not args.get("path"):
+        return (
+            _tool_resp(name, "error", 'Missing required "path" argument.'),
+            False,
+            always_approve,
+        )
+    if name == "run_command" and not args.get("cmd"):
+        return (
+            _tool_resp(name, "error", 'Missing required "cmd" argument.'),
+            False,
+            always_approve,
+        )
+
+    # ------ Confirmation for modifying tools ------
     if is_modifying and not always_approve:
         console.print()
-        
-        # Visual cues depending on tool
+
         if name == "run_command":
-            console.print(Panel(f"[yellow]Command:[/yellow] {args.get('cmd')}", title="Proposed command execution", border_style="yellow"))
+            console.print(
+                Panel(
+                    f"[yellow]Command:[/yellow] {args.get('cmd')}",
+                    title="Proposed command execution",
+                    border_style="yellow",
+                )
+            )
         elif name == "write_file":
-            path = args.get('path')
-            content = args.get('content', '')
-            abs_path = os.path.abspath(path)
-            if os.path.exists(abs_path):
-                try:
-                    with open(abs_path, 'r', encoding='utf-8') as f:
-                        old_content = f.read()
-                    diff_text = get_diff(old_content, content, path)
-                    console.print(Panel(diff_text, title=f"Overwriting {path} (Diff)", border_style="yellow"))
-                except Exception:
-                    console.print(Panel(f"Overwriting {path}", title="Proposed file write", border_style="yellow"))
-            else:
-                diff_text = get_diff("", content, path)
-                console.print(Panel(diff_text, title=f"Creating new file {path}", border_style="green"))
+            _show_write_diff(args)
         elif name == "edit_file":
-            path = args.get('path')
-            search = args.get('search')
-            replace = args.get('replace')
-            abs_path = os.path.abspath(path)
-            if os.path.exists(abs_path):
-                try:
-                    with open(abs_path, 'r', encoding='utf-8') as f:
-                        content = f.read()
-                    if search in content:
-                        new_content = content.replace(search, replace, 1)
-                        diff_text = get_diff(content, new_content, path)
-                        console.print(Panel(diff_text, title=f"Editing {path} (Diff)", border_style="yellow"))
-                    else:
-                        console.print(Panel(f"[red]Search block not found exactly in file.[/red]", title="Diff error", border_style="red"))
-                except Exception as e:
-                    console.print(Panel(f"Error preparing diff: {e}", title="Diff error", border_style="red"))
-        
-        console.print(f"[warning]Tool Call:[/warning] [bold cyan]{name}[/bold cyan] requires permission.")
-        choice = Prompt.ask("Confirm execution? ([bold green]y[/bold green]es / [bold red]n[/bold red]o / [bold yellow]a[/bold yellow]lways / [bold magenta]c[/bold magenta]ancel)", choices=["y", "n", "a", "c"], default="y")
-        
+            _show_edit_diff(args)
+
+        console.print(
+            f"[warning]Tool Call:[/warning] [bold cyan]{name}[/bold cyan] requires permission."
+        )
+        choice = Prompt.ask(
+            "Confirm execution? "
+            "([bold green]y[/bold green]es / [bold red]n[/bold red]o / "
+            "[bold yellow]a[/bold yellow]lways / [bold magenta]c[/bold magenta]ancel)",
+            choices=["y", "n", "a", "c"],
+            default="y",
+        )
+
         if choice == "n":
-            return f"<tool_response name=\"{name}\"><status>error</status><message>Execution declined by user.</message></tool_response>", False
-        elif choice == "c":
-            return "", True
-        elif choice == "a":
-            # Set parent loop variable to always approve from now on
+            return (
+                _tool_resp(name, "error", "Execution declined by user."),
+                False,
+                always_approve,
+            )
+        if choice == "c":
+            return ("", True, always_approve)
+        if choice == "a":
             always_approve = True
-            
-    # Run the tool
+
+    # ------ Execute ------
     console.print(f"⚙️  [info]Executing {name}...[/info]")
-    
+
     try:
         if name == "list_dir":
-            result = list_dir(args.get("path", "."))
+            result = list_dir(args.get("path", "."), depth=args.get("depth", 2))
         elif name == "view_file":
             result = view_file(
-                args.get("path"), 
-                start_line=args.get("start_line", 1), 
-                end_line=args.get("end_line")
+                args.get("path"),
+                start_line=args.get("start_line", 1),
+                end_line=args.get("end_line"),
             )
         elif name == "write_file":
             result = write_file(args.get("path"), args.get("content", ""))
         elif name == "edit_file":
-            result = edit_file(args.get("path"), args.get("search", ""), args.get("replace", ""))
+            result = edit_file(
+                args.get("path"), args.get("search", ""), args.get("replace", "")
+            )
         elif name == "grep_search":
             result = grep_search(args.get("pattern"), args.get("path", "."))
         elif name == "run_command":
             result = run_command(args.get("cmd"))
         else:
-            result = f"Error: Unknown tool name '{name}'"
-            
-        status = "success" if not result.startswith("Error") else "error"
+            result = f"Error: Unknown tool '{name}'"
+
+        status = "error" if result.startswith("Error") else "success"
     except Exception as e:
-        result = f"Unexpected execution error: {str(e)}"
+        result = f"Unexpected error: {e}"
         status = "error"
-        
-    response = f"<tool_response name=\"{name}\"><status>{status}</status><message>{result}</message></tool_response>"
-    return response, False
+
+    # Truncate very large outputs to avoid blowing up context.
+    if len(result) > MAX_TOOL_OUTPUT_CHARS:
+        result = result[:MAX_TOOL_OUTPUT_CHARS] + "\n... (output truncated)"
+
+    return (_tool_resp(name, status, result), False, always_approve)
+
+
+def _tool_resp(name: str, status: str, message: str) -> str:
+    return (
+        f'<tool_response name="{name}">'
+        f"<status>{status}</status>"
+        f"<message>{message}</message>"
+        f"</tool_response>"
+    )
+
+
+def _show_write_diff(args: Dict[str, Any]) -> None:
+    path = args.get("path", "")
+    content = args.get("content", "")
+    abs_path = os.path.abspath(path)
+    if os.path.exists(abs_path):
+        try:
+            with open(abs_path, "r", encoding="utf-8") as f:
+                old = f.read()
+            console.print(
+                Panel(get_diff(old, content, path), title=f"Overwriting {path}", border_style="yellow")
+            )
+        except Exception:
+            console.print(Panel(f"Overwriting {path}", title="Proposed file write", border_style="yellow"))
+    else:
+        console.print(
+            Panel(get_diff("", content, path), title=f"Creating {path}", border_style="green")
+        )
+
+
+def _show_edit_diff(args: Dict[str, Any]) -> None:
+    path = args.get("path", "")
+    search = args.get("search", "")
+    replace = args.get("replace", "")
+    abs_path = os.path.abspath(path)
+    if os.path.exists(abs_path):
+        try:
+            with open(abs_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            if search in content:
+                new = content.replace(search, replace, 1)
+                console.print(
+                    Panel(get_diff(content, new, path), title=f"Editing {path}", border_style="yellow")
+                )
+            else:
+                console.print(
+                    Panel("[red]Search block not found exactly in file.[/red]", title="Diff error", border_style="red")
+                )
+        except Exception as e:
+            console.print(Panel(f"Error: {e}", title="Diff error", border_style="red"))
+
+
+# ---------------------------------------------------------------------------
+# Context management
+# ---------------------------------------------------------------------------
+
+def _prune_context(messages: List[Dict[str, str]]) -> None:
+    """Trim older tool-exchange pairs when the conversation grows too long.
+
+    Keeps the system prompt (index 0), the last user message, and recent
+    exchanges intact.  Older tool response messages are summarised.
+    """
+    if len(messages) <= CONTEXT_MAX_MESSAGES:
+        return
+
+    # Keep system prompt + the most recent 20 messages.  Summarise the rest.
+    keep_recent = 20
+    cutoff = len(messages) - keep_recent
+
+    # Don't touch index 0 (system prompt).
+    for i in range(1, cutoff):
+        msg = messages[i]
+        content = msg.get("content", "")
+        # Compress long tool response messages.
+        if msg["role"] == "user" and "<tool_response" in content and len(content) > 500:
+            # Extract just the status lines.
+            statuses = re.findall(r'<tool_response name="([^"]+)">\s*<status>(\w+)</status>', content)
+            if statuses:
+                summary = "; ".join(f"{n}: {s}" for n, s in statuses)
+                messages[i] = {"role": "user", "content": f"[Earlier tool results: {summary}]"}
+        elif msg["role"] == "assistant" and len(content) > 1000:
+            # Trim very long assistant messages, keeping the first 300 chars.
+            messages[i] = {
+                "role": "assistant",
+                "content": content[:300] + "\n... (earlier response trimmed)",
+            }
+
+
+# ---------------------------------------------------------------------------
+# Spinner / thinking UI
+# ---------------------------------------------------------------------------
+
+_THINKING_WORDS = [
+    "Pondering", "Analyzing", "Synthesizing", "Reflecting",
+    "Deliberating", "Contemplating", "Evaluating", "Deciphering",
+    "Formulating", "Processing", "Reasoning",
+]
+
+
+# ---------------------------------------------------------------------------
+# Main agentic loop
+# ---------------------------------------------------------------------------
 
 def run_agentic_loop(messages: List[Dict[str, str]], client: ollama.Client) -> bool:
-    """
-    Runs the agent loop until the agent completes its task or is cancelled.
-    Returns True if completed, False if cancelled.
+    """Run the agent loop until the model stops calling tools or we hit the cap.
+
+    Returns ``True`` if completed normally, ``False`` if cancelled.
     """
     always_approve = False
-    
-    while True:
-        response_text = ""
-        
-        try:
-            # Dynamic thinking synonyms
-            THINKING_SYNONYMS = [
-                "Pondering",
-                "Analyzing",
-                "Synthesizing",
-                "Reflecting",
-                "Deliberating",
-                "Contemplating",
-                "Musing",
-                "Evaluating",
-                "Deciphering",
-                "Formulating",
-                "Processing",
-                "Cogitating"
-            ]
-            current_synonym = random.choice(THINKING_SYNONYMS)
-            thinking = True
-            
-            initial_spinner = Spinner("dots", text=Text(f" {current_synonym}...", style="bold bright_magenta"))
-            
-            console.print()
-            with Live(initial_spinner, refresh_per_second=10, console=console) as live:
-                # Background thread to cycle synonyms every 5 seconds
-                def update_spinner():
-                    nonlocal current_synonym
-                    start_time = time.time()
-                    while thinking:
-                        elapsed = time.time() - start_time
-                        if elapsed >= 5.0:
-                            remaining = [s for s in THINKING_SYNONYMS if s != current_synonym]
-                            current_synonym = random.choice(remaining) if remaining else current_synonym
-                            start_time = time.time()
-                        
-                        live.update(Spinner("dots", text=Text(f" {current_synonym}...", style="bold bright_magenta")))
-                        time.sleep(0.1)
+    iteration = 0
 
-                t = threading.Thread(target=update_spinner, daemon=True)
+    while iteration < MAX_ITERATIONS:
+        iteration += 1
+        response_text = ""
+
+        try:
+            # --- Spinner setup ---
+            current_word = random.choice(_THINKING_WORDS)
+            thinking = True
+
+            spinner = Spinner("dots", text=Text(f" {current_word}...", style="bold bright_magenta"))
+            console.print()
+
+            with Live(spinner, refresh_per_second=8, console=console) as live:
+                # Background thread cycles the word every 4s.
+                def _cycle_spinner() -> None:
+                    nonlocal current_word
+                    last_change = time.monotonic()
+                    while thinking:
+                        if time.monotonic() - last_change >= 4.0:
+                            remaining = [w for w in _THINKING_WORDS if w != current_word]
+                            current_word = random.choice(remaining) if remaining else current_word
+                            last_change = time.monotonic()
+                        live.update(
+                            Spinner("dots", text=Text(f" {current_word}...", style="bold bright_magenta"))
+                        )
+                        time.sleep(0.5)  # 0.5s vs original 0.1s — much less CPU
+
+                t = threading.Thread(target=_cycle_spinner, daemon=True)
                 t.start()
-                
+
                 try:
-                    # Stream the completion from Ollama
-                    # Disable thinking mode for speed — ornith:9b supports it but it causes
-                    # very long prefill delays for complex prompts
                     stream = client.chat(
                         model=MODEL_NAME,
                         messages=messages,
                         stream=True,
-                        think=False
+                        think=False,
                     )
-                    stream_iterator = iter(stream)
+                    stream_iter = iter(stream)
                 except Exception as e:
                     thinking = False
                     t.join(timeout=1.0)
-                    raise e
-                
-                # Print chunks as they stream, hiding raw XML tool calls for speed & clean terminal UI
+                    raise
+
+                # --- Stream chunks, hiding raw XML tool calls ---
                 in_tool_call = False
-                
-                for chunk in stream_iterator:
-                    content = chunk.get('message', {}).get('content', '') or ''
+
+                for chunk in stream_iter:
+                    content = chunk.get("message", {}).get("content", "") or ""
                     if not content:
                         continue
-                    
+
                     if thinking:
                         thinking = False
                         t.join(timeout=1.0)
-                        
+
                     response_text += content
-                    
-                    tool_call_start = response_text.find("<tool_call")
-                    if tool_call_start != -1:
+
+                    # Check if we've entered a tool call block.
+                    tool_start = response_text.find("<tool_call")
+                    if tool_start != -1:
                         in_tool_call = True
-                        non_tool_text = response_text[:tool_call_start].strip()
-                        live.update(Markdown(non_tool_text))
+                        prose = response_text[:tool_start].strip()
+                        if prose:
+                            live.update(Markdown(prose))
                         break
                     else:
                         live.update(Markdown(response_text.strip()))
-                        
+
                 if thinking:
                     thinking = False
                     t.join(timeout=1.0)
-            
+
+            # If we broke out of the Live context because of a tool call,
+            # consume the rest of the stream silently.
             if in_tool_call:
-                console.print("[info]⚙️  Formulating tool call(s)...[/info]", end="")
-                for chunk in stream_iterator:
-                    content = chunk.get('message', {}).get('content', '') or ''
+                console.print("[info]⚙️  Formulating tool call(s)...[/info]")
+                for chunk in stream_iter:
+                    content = chunk.get("message", {}).get("content", "") or ""
                     response_text += content
-                    if len(response_text) % 80 == 0:
-                        print(".", end="", flush=True)
-                print()
-            
+
+        except KeyboardInterrupt:
+            raise  # Let the CLI handle it.
         except Exception as e:
             console.print(f"\n[danger]Ollama error:[/danger] {e}")
             return False
-            
-        # Add assistant response to history
+
+        # --- Record assistant message ---
         messages.append({"role": "assistant", "content": response_text})
-        
-        # Parse for tool calls
+
+        # --- Parse tool calls ---
         calls = parse_tool_calls(response_text)
         if not calls:
-            # If no tools called, we assume the assistant is done or waiting for input
-            break
-            
-        # Execute tool calls
-        tool_responses = []
-        for call in calls:
-            name = call["name"]
-            args = call["args"]
-            
-            resp, should_cancel = execute_tool(name, args, always_approve)
+            break  # Model is done — no tools invoked.
+
+        # --- Execute tool calls ---
+        tool_responses: list[str] = []
+        total = len(calls)
+
+        for idx, call in enumerate(calls, start=1):
+            if total > 1:
+                console.print(f"[dim]  Tool {idx}/{total}[/dim]")
+
+            resp, should_cancel, always_approve = execute_tool(
+                call["name"], call["args"], always_approve
+            )
+
             if should_cancel:
                 console.print("[warning]Task cancelled by user.[/warning]")
-                # Remove assistant's message that provoked the cancellation so history stays clean
-                messages.pop()
+                messages.pop()  # Remove assistant msg that triggered cancellation.
                 return False
-                
-            # If user selected "always", propagate it
-            if "always" in resp or (name in ('write_file', 'edit_file', 'run_command') and always_approve == False and resp and "Execution declined" not in resp):
-                pass 
-                
+
             tool_responses.append(resp)
-            
-        # Feed all responses back in a single user message
-        combined_response = "\n".join(tool_responses)
-        messages.append({"role": "user", "content": combined_response})
-        
+
+        # Feed tool results back as a single user message.
+        combined = "\n".join(tool_responses)
+        messages.append({"role": "user", "content": combined})
+
+        # Prune context if it's getting long.
+        _prune_context(messages)
+
+    else:
+        console.print(
+            f"[warning]⚠ Agent reached the iteration limit ({MAX_ITERATIONS}). "
+            "Stopping to avoid an infinite loop.[/warning]"
+        )
+
     return True
