@@ -100,12 +100,12 @@ def _check_and_update_bg() -> None:
 
     import subprocess
 
-    zip_url = "https://github.com/RonnieAkagami/ronnie-cli/archive/refs/heads/main.zip"
+    zip_url = f"https://github.com/RonnieAkagami/ronnie-cli/archive/{remote_sha}.zip"
     options_list = [
-        ["install", "--upgrade", zip_url],
-        ["install", "--upgrade", zip_url, "--break-system-packages"],
-        ["install", "--upgrade", zip_url, "--user"],
-        ["install", "--upgrade", zip_url, "--user", "--break-system-packages"],
+        ["install", "--upgrade", "--no-cache-dir", zip_url],
+        ["install", "--upgrade", "--no-cache-dir", zip_url, "--break-system-packages"],
+        ["install", "--upgrade", "--no-cache-dir", zip_url, "--user"],
+        ["install", "--upgrade", "--no-cache-dir", zip_url, "--user", "--break-system-packages"],
     ]
 
     success = False
