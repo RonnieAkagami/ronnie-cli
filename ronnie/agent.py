@@ -30,34 +30,53 @@ from ronnie.tools import list_dir, view_file, write_file, edit_file, grep_search
 
 
 # ---------------------------------------------------------------------------
-# XML tool-call parser
+# XML tool-call parser (resilient to common model mistakes)
 # ---------------------------------------------------------------------------
 
 def parse_tool_calls(text: str) -> List[Dict[str, Any]]:
     """Extract ``<tool_call name="…">…</tool_call>`` blocks from *text*.
 
+    Resilient to common model quirks:
+    - Single or double quotes on name attribute
+    - Missing quotes: ``name=view_file``
+    - Extra whitespace inside angle brackets
+    - Unclosed ``</tool_call>`` tags (tries to recover)
+
     Uses greedy matching for ``content``, ``search``, and ``replace`` tags to
     handle code containing angle brackets (``x < 5``, ``</div>``, etc.).
     """
+    # --- Phase 1: Fix up common malformations before parsing ---
+    cleaned = text
+
+    # Fix unclosed tool_call tags — if there's an opening <tool_call but no
+    # closing </tool_call>, append one at the end.
+    open_count = len(re.findall(r"<\s*tool_call[\s>]", cleaned))
+    close_count = len(re.findall(r"</\s*tool_call\s*>", cleaned))
+    if open_count > close_count:
+        cleaned += "\n</tool_call>" * (open_count - close_count)
+
+    # --- Phase 2: Extract tool calls with flexible pattern ---
+    # Accept: name="x", name='x', name=x
     tool_call_pattern = re.compile(
-        r"<tool_call\s+name=\"([^\"]+)\"\s*>(.*?)</tool_call>", re.DOTALL
+        r"<\s*tool_call\s+name\s*=\s*[\"']?([^\"'>\s]+)[\"']?\s*>(.*?)<\s*/\s*tool_call\s*>",
+        re.DOTALL,
     )
     calls: list[dict[str, Any]] = []
 
-    for match in tool_call_pattern.finditer(text):
-        tool_name = match.group(1)
+    for match in tool_call_pattern.finditer(cleaned):
+        tool_name = match.group(1).strip()
         body = match.group(2)
         args: dict[str, str] = {}
 
         # Greedy match for large-body tags (content/search/replace).
         for tag in ("content", "search", "replace"):
-            tag_re = re.compile(rf"<{tag}>(.*)</{tag}>", re.DOTALL)
+            tag_re = re.compile(rf"<\s*{tag}\s*>(.*)<\s*/\s*{tag}\s*>", re.DOTALL)
             m = tag_re.search(body)
             if m:
                 args[tag] = m.group(1)
 
         # Non-greedy match for short parameter tags.
-        simple_re = re.compile(r"<([a-zA-Z0-9_]+)>(.*?)</\1>", re.DOTALL)
+        simple_re = re.compile(r"<\s*([a-zA-Z0-9_]+)\s*>(.*?)<\s*/\s*\1\s*>", re.DOTALL)
         for m in simple_re.finditer(body):
             pname = m.group(1)
             if pname not in args:  # don't overwrite greedy matches
@@ -251,39 +270,105 @@ def _show_edit_diff(args: Dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Context management
+# Context management (enhanced — smarter pruning)
 # ---------------------------------------------------------------------------
 
 def _prune_context(messages: List[Dict[str, str]]) -> None:
     """Trim older tool-exchange pairs when the conversation grows too long.
 
-    Keeps the system prompt (index 0), the last user message, and recent
-    exchanges intact.  Older tool response messages are summarised.
+    Strategy:
+    - Never touch index 0 (system prompt) or the last 6 exchanges (12 messages).
+    - For older messages, compress tool responses but keep file-read results
+      longer than command outputs (they're more valuable for code generation).
+    - Smart truncation for view_file results: keep first 50 + last 20 lines.
     """
     if len(messages) <= CONTEXT_MAX_MESSAGES:
         return
 
-    # Keep system prompt + the most recent 20 messages.  Summarise the rest.
-    keep_recent = 20
+    # Keep system prompt + the most recent 12 messages (6 exchanges).
+    keep_recent = 12
     cutoff = len(messages) - keep_recent
 
-    # Don't touch index 0 (system prompt).
     for i in range(1, cutoff):
         msg = messages[i]
         content = msg.get("content", "")
-        # Compress long tool response messages.
-        if msg["role"] == "user" and "<tool_response" in content and len(content) > 500:
-            # Extract just the status lines.
-            statuses = re.findall(r'<tool_response name="([^"]+)">\s*<status>(\w+)</status>', content)
-            if statuses:
-                summary = "; ".join(f"{n}: {s}" for n, s in statuses)
-                messages[i] = {"role": "user", "content": f"[Earlier tool results: {summary}]"}
-        elif msg["role"] == "assistant" and len(content) > 1000:
-            # Trim very long assistant messages, keeping the first 300 chars.
+
+        if msg["role"] == "user" and "<tool_response" in content:
+            if len(content) <= 600:
+                continue  # Small responses: keep as-is.
+
+            # Check if this contains file-read results (more valuable — keep longer).
+            has_file_content = "--- File:" in content and "--- End of File ---" in content
+
+            if has_file_content and len(content) <= 3000:
+                # Keep file reads up to 3KB intact.
+                continue
+            elif has_file_content:
+                # Smart truncation: keep first 50 lines + last 20 lines of file content.
+                messages[i] = {"role": "user", "content": _smart_truncate_file_response(content)}
+            else:
+                # Command/tool outputs: extract just the status summary.
+                statuses = re.findall(
+                    r'<tool_response name="([^"]+)">\s*<status>(\w+)</status>', content
+                )
+                if statuses:
+                    summary = "; ".join(f"{n}: {s}" for n, s in statuses)
+                    messages[i] = {"role": "user", "content": f"[Earlier tool results: {summary}]"}
+
+        elif msg["role"] == "assistant" and len(content) > 1500:
             messages[i] = {
                 "role": "assistant",
-                "content": content[:300] + "\n... (earlier response trimmed)",
+                "content": content[:400] + "\n... (earlier response trimmed)",
             }
+
+
+def _smart_truncate_file_response(content: str) -> str:
+    """Truncate file content keeping first 50 + last 20 lines."""
+    lines = content.splitlines()
+    if len(lines) <= 80:
+        return content
+
+    head = lines[:50]
+    tail = lines[-20:]
+    skipped = len(lines) - 70
+    return "\n".join(head) + f"\n... ({skipped} lines omitted) ...\n" + "\n".join(tail)
+
+
+# ---------------------------------------------------------------------------
+# Session token tracking
+# ---------------------------------------------------------------------------
+
+class _SessionTokens:
+    """Cumulative token counter for the entire session."""
+    def __init__(self) -> None:
+        self.prompt_tokens: int = 0
+        self.completion_tokens: int = 0
+
+    @property
+    def total(self) -> int:
+        return self.prompt_tokens + self.completion_tokens
+
+    def add(self, prompt: int, completion: int) -> None:
+        self.prompt_tokens += prompt
+        self.completion_tokens += completion
+
+    def reset(self) -> None:
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+
+
+def _fmt_tokens(n: int) -> str:
+    """Format token count: 800 → '800', 1200 → '1.2K', 15000 → '15K'."""
+    if n < 1000:
+        return str(n)
+    elif n < 10_000:
+        return f"{n / 1000:.1f}K"
+    else:
+        return f"{n // 1000}K"
+
+
+# Global session counter — persists across turns within one `ronnie` session.
+session_tokens = _SessionTokens()
 
 
 # ---------------------------------------------------------------------------
@@ -312,6 +397,7 @@ def run_agentic_loop(messages: List[Dict[str, str]], client: ollama.Client) -> b
     while iteration < MAX_ITERATIONS:
         iteration += 1
         response_text = ""
+        loop_start = time.monotonic()
 
         try:
             # --- Spinner setup ---
@@ -334,7 +420,7 @@ def run_agentic_loop(messages: List[Dict[str, str]], client: ollama.Client) -> b
                         live.update(
                             Spinner("dots", text=Text(f" {current_word}...", style="bold bright_magenta"))
                         )
-                        time.sleep(0.5)  # 0.5s vs original 0.1s — much less CPU
+                        time.sleep(0.5)
 
                 t = threading.Thread(target=_cycle_spinner, daemon=True)
                 t.start()
@@ -354,8 +440,10 @@ def run_agentic_loop(messages: List[Dict[str, str]], client: ollama.Client) -> b
 
                 # --- Stream chunks, hiding raw XML tool calls ---
                 in_tool_call = False
+                last_chunk = None  # Track final chunk for token stats.
 
                 for chunk in stream_iter:
+                    last_chunk = chunk
                     content = chunk.get("message", {}).get("content", "") or ""
                     if not content:
                         continue
@@ -386,6 +474,7 @@ def run_agentic_loop(messages: List[Dict[str, str]], client: ollama.Client) -> b
             if in_tool_call:
                 console.print("[info]⚙️  Formulating tool call(s)...[/info]")
                 for chunk in stream_iter:
+                    last_chunk = chunk
                     content = chunk.get("message", {}).get("content", "") or ""
                     response_text += content
 
@@ -394,6 +483,28 @@ def run_agentic_loop(messages: List[Dict[str, str]], client: ollama.Client) -> b
         except Exception as e:
             console.print(f"\n[danger]Ollama error:[/danger] {e}")
             return False
+
+        # --- Extract real token counts from Ollama's final chunk ---
+        elapsed = time.monotonic() - loop_start
+        turn_prompt = 0
+        turn_completion = 0
+
+        if last_chunk is not None:
+            turn_prompt = getattr(last_chunk, "prompt_eval_count", 0) or 0
+            turn_completion = getattr(last_chunk, "eval_count", 0) or 0
+            session_tokens.add(turn_prompt, turn_completion)
+
+        # Display: per-turn stats + cumulative session total.
+        turn_total = turn_prompt + turn_completion
+        if turn_total > 0:
+            tps = turn_completion / elapsed if elapsed > 0 else 0
+            console.print(
+                f"[dim]  {_fmt_tokens(turn_prompt)} in · "
+                f"{_fmt_tokens(turn_completion)} out · "
+                f"{tps:.0f} tok/s · "
+                f"{elapsed:.1f}s "
+                f"(session: {_fmt_tokens(session_tokens.total)} tokens)[/dim]"
+            )
 
         # --- Record assistant message ---
         messages.append({"role": "assistant", "content": response_text})
@@ -406,10 +517,12 @@ def run_agentic_loop(messages: List[Dict[str, str]], client: ollama.Client) -> b
         # --- Execute tool calls ---
         tool_responses: list[str] = []
         total = len(calls)
+        files_modified: list[str] = []
+        files_created: list[str] = []
 
         for idx, call in enumerate(calls, start=1):
-            if total > 1:
-                console.print(f"[dim]  Tool {idx}/{total}[/dim]")
+            step_label = f"[dim]  [Step {iteration}/{MAX_ITERATIONS}] Tool {idx}/{total}[/dim]"
+            console.print(step_label)
 
             resp, should_cancel, always_approve = execute_tool(
                 call["name"], call["args"], always_approve
@@ -420,7 +533,24 @@ def run_agentic_loop(messages: List[Dict[str, str]], client: ollama.Client) -> b
                 messages.pop()  # Remove assistant msg that triggered cancellation.
                 return False
 
+            # Track file changes for summary.
+            if call["name"] in ("write_file", "edit_file") and "Success" in resp:
+                fpath = call["args"].get("path", "?")
+                if call["name"] == "write_file" and not os.path.exists(os.path.abspath(fpath)):
+                    files_created.append(fpath)
+                else:
+                    files_modified.append(fpath)
+
             tool_responses.append(resp)
+
+        # --- File change summary ---
+        change_parts: list[str] = []
+        if files_created:
+            change_parts.append(f"Created: {', '.join(files_created)}")
+        if files_modified:
+            change_parts.append(f"Modified: {', '.join(files_modified)}")
+        if change_parts:
+            console.print(f"[success]  📁 {' · '.join(change_parts)}[/success]")
 
         # Feed tool results back as a single user message.
         combined = "\n".join(tool_responses)

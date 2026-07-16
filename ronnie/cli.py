@@ -1,5 +1,7 @@
 """Ronnie CLI — entry point, REPL, auto-update, and banner."""
 
+from __future__ import annotations
+
 import os
 import sys
 import readline
@@ -13,7 +15,8 @@ from rich.prompt import Prompt
 
 from ronnie.config import console, MODEL_NAME, history_file
 from ronnie.prompts import build_system_prompt
-from ronnie.agent import run_agentic_loop
+from ronnie.agent import run_agentic_loop, session_tokens, _fmt_tokens
+from ronnie.tools import undo_last, undo_stack_depth
 
 # ---------------------------------------------------------------------------
 # CLI history
@@ -154,10 +157,12 @@ def _check_and_update_bg() -> None:
 
 _HELP_TEXT = """\
 [bold cyan]Available Commands[/bold cyan]
-  [bold yellow]/clear[/bold yellow]   Clear conversation history
-  [bold yellow]/help[/bold yellow]    Show this help message
-  [bold yellow]/model[/bold yellow]   Show the current model name
-  [bold yellow]/exit[/bold yellow]    Exit Ronnie (also: /quit)
+  [bold yellow]/clear[/bold yellow]    Clear conversation history
+  [bold yellow]/undo[/bold yellow]     Undo the last file modification
+  [bold yellow]/tokens[/bold yellow]   Show session token usage
+  [bold yellow]/help[/bold yellow]     Show this help message
+  [bold yellow]/model[/bold yellow]    Show the current model name
+  [bold yellow]/exit[/bold yellow]     Exit Ronnie (also: /quit)
 """
 
 
@@ -174,7 +179,8 @@ def _handle_slash_command(
     if lower == "/clear":
         messages.clear()
         messages.append({"role": "system", "content": system_prompt})
-        console.print("[success]Conversation history cleared.[/success]")
+        session_tokens.reset()
+        console.print("[success]Conversation history cleared. Token counter reset.[/success]")
         return True
 
     if lower == "/help":
@@ -183,6 +189,30 @@ def _handle_slash_command(
 
     if lower == "/model":
         console.print(f"[info]Current model:[/info] [bold]{MODEL_NAME}[/bold]")
+        return True
+
+    if lower == "/undo":
+        depth = undo_stack_depth()
+        if depth == 0:
+            console.print("[warning]Nothing to undo.[/warning]")
+        else:
+            result = undo_last()
+            console.print(f"[success]{result}[/success]")
+            remaining = undo_stack_depth()
+            if remaining > 0:
+                console.print(f"[dim]  ({remaining} more undo{'s' if remaining != 1 else ''} available)[/dim]")
+        return True
+
+    if lower == "/tokens":
+        if session_tokens.total == 0:
+            console.print("[dim]No tokens used yet in this session.[/dim]")
+        else:
+            console.print(
+                f"[bold cyan]Session Token Usage[/bold cyan]\n"
+                f"  Prompt (input):     [bold]{_fmt_tokens(session_tokens.prompt_tokens)}[/bold]\n"
+                f"  Completion (output): [bold]{_fmt_tokens(session_tokens.completion_tokens)}[/bold]\n"
+                f"  Total:              [bold]{_fmt_tokens(session_tokens.total)}[/bold]"
+            )
         return True
 
     return False
@@ -203,7 +233,7 @@ _BANNER = """\
 [bold cyan]Ronnie CLI — Local Agentic Coding Partner[/bold cyan]
 Powered by [bold magenta]{model}[/bold magenta]
 
-Commands: [bold yellow]/help[/bold yellow] · [bold yellow]/clear[/bold yellow] · [bold yellow]/exit[/bold yellow]
+Commands: [bold yellow]/help[/bold yellow] · [bold yellow]/clear[/bold yellow] · [bold yellow]/undo[/bold yellow] · [bold yellow]/exit[/bold yellow]
 """
 
 
@@ -231,7 +261,7 @@ def main() -> None:
     # Banner.
     console.print(Panel(_BANNER.format(model=MODEL_NAME), border_style="bright_magenta"))
 
-    # Build system prompt with CWD injected.
+    # Build system prompt with CWD + project context injected.
     cwd = os.getcwd()
     system_prompt = build_system_prompt(cwd)
     messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]

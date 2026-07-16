@@ -6,6 +6,8 @@ import os
 import re
 import subprocess
 import time
+from collections import deque
+from dataclasses import dataclass, field
 from typing import Optional
 
 from ronnie.config import (
@@ -32,6 +34,64 @@ def _is_binary(path: str, chunk_size: int = 8192) -> bool:
             return b"\x00" in f.read(chunk_size)
     except Exception:
         return True
+
+
+# ---------------------------------------------------------------------------
+# File backup / undo system
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _FileSnapshot:
+    """A snapshot of a file before modification."""
+    path: str             # absolute path
+    content: str | None   # None means the file didn't exist (was created)
+    operation: str        # "write_file" or "edit_file"
+
+
+_undo_stack: deque[_FileSnapshot] = deque(maxlen=20)
+
+
+def _backup_file(abs_path: str, operation: str) -> None:
+    """Save current file content (or None if new) to the undo stack."""
+    if os.path.exists(abs_path):
+        try:
+            with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except Exception:
+            content = None
+    else:
+        content = None
+    _undo_stack.append(_FileSnapshot(path=abs_path, content=content, operation=operation))
+
+
+def undo_last() -> str:
+    """Undo the last file modification. Returns a status message."""
+    if not _undo_stack:
+        return "Nothing to undo."
+
+    snap = _undo_stack.pop()
+    rel = os.path.relpath(snap.path)
+
+    if snap.content is None:
+        # File was created — delete it.
+        try:
+            os.remove(snap.path)
+            return f"Undone: Deleted newly created file '{rel}'."
+        except Exception as e:
+            return f"Undo failed: Could not delete '{rel}': {e}"
+    else:
+        # File was modified — restore content.
+        try:
+            with open(snap.path, "w", encoding="utf-8") as f:
+                f.write(snap.content)
+            return f"Undone: Restored '{rel}' to its previous state."
+        except Exception as e:
+            return f"Undo failed: Could not restore '{rel}': {e}"
+
+
+def undo_stack_depth() -> int:
+    """Return the number of undoable operations."""
+    return len(_undo_stack)
 
 
 # ---------------------------------------------------------------------------
@@ -98,10 +158,25 @@ def view_file(
     """Read a text file, optionally a specific line range.
 
     Refuses to read binary files or files larger than VIEW_FILE_MAX_BYTES.
+    On file-not-found, lists the actual directory contents to help self-correct.
     """
     abs_path = os.path.abspath(path)
     if not os.path.exists(abs_path):
-        return f"Error: File '{path}' does not exist."
+        # Self-correcting: show what files ARE in the directory.
+        parent = os.path.dirname(abs_path)
+        hint = ""
+        if os.path.isdir(parent):
+            try:
+                siblings = sorted(os.listdir(parent))[:20]
+                if siblings:
+                    hint = (
+                        f"\nFiles in '{os.path.relpath(parent)}': "
+                        + ", ".join(siblings)
+                    )
+            except Exception:
+                pass
+        return f"Error: File '{path}' does not exist.{hint}"
+
     if not os.path.isfile(abs_path):
         return f"Error: '{path}' is not a regular file."
 
@@ -145,16 +220,27 @@ def view_file(
 # ---------------------------------------------------------------------------
 
 def write_file(path: str, content: str) -> str:
-    """Create or overwrite a file.  Creates parent directories as needed."""
+    """Create or overwrite a file.  Creates parent directories as needed.
+    Saves a backup for /undo before writing.
+    """
     abs_path = os.path.abspath(path)
     try:
         parent = os.path.dirname(abs_path)
         if parent:
             os.makedirs(parent, exist_ok=True)
+
+        # Backup before writing.
+        _backup_file(abs_path, "write_file")
+
         with open(abs_path, "w", encoding="utf-8") as f:
             f.write(content)
         line_count = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
         return f"Success: Wrote {line_count} lines to '{path}'."
+    except PermissionError:
+        return (
+            f"Error: Permission denied writing to '{path}'. "
+            "Try using run_command with `chmod` or `sudo` to fix permissions."
+        )
     except Exception as e:
         return f"Error writing file: {e}"
 
@@ -172,6 +258,8 @@ def edit_file(path: str, search: str, replace: str) -> str:
     """Replace the first exact occurrence of *search* with *replace* in *path*.
 
     Falls back to whitespace-normalized matching if the exact match fails.
+    On failure, includes actual file lines to help the model self-correct.
+    Saves a backup for /undo before writing.
     """
     abs_path = os.path.abspath(path)
     if not os.path.exists(abs_path):
@@ -189,35 +277,43 @@ def edit_file(path: str, search: str, replace: str) -> str:
                     f"Error: The search block matches {count} times in '{path}'. "
                     "Please provide a more unique search string."
                 )
+            # Backup before modifying.
+            _backup_file(abs_path, "edit_file")
             new_content = content.replace(search, replace, 1)
         else:
             # --- Whitespace-normalised fallback ---
             norm_search = _normalize_ws(search)
-            # Walk through lines and find a contiguous block that matches when normalised.
             lines = content.splitlines(keepends=True)
             search_lines = search.splitlines()
             match_start = None
             match_end = None
 
             for i in range(len(lines)):
-                # Try matching search_lines starting at line i.
                 candidate = "".join(lines[i : i + len(search_lines)])
                 if _normalize_ws(candidate) == norm_search:
                     if match_start is not None:
                         return (
-                            f"Error: Whitespace-normalised match found multiple times. "
+                            "Error: Whitespace-normalised match found multiple times. "
                             "Please provide a more unique search string."
                         )
                     match_start = i
                     match_end = i + len(search_lines)
 
             if match_start is None:
+                # Self-correcting: show the actual file content around where the
+                # search might have been, so the model can see what's really there.
+                file_lines = content.splitlines()
+                preview_lines = file_lines[:15]
+                preview = "\n".join(f"  {i+1}: {l}" for i, l in enumerate(preview_lines))
+                suffix = f"\n  ... ({len(file_lines)} total lines)" if len(file_lines) > 15 else ""
                 return (
-                    f"Error: The search block was not found in '{path}'. "
-                    "Use view_file to check the actual file content and ensure "
-                    "whitespace/formatting matches exactly."
+                    f"Error: The search block was not found in '{path}'.\n"
+                    f"Actual file content (first 15 lines):\n{preview}{suffix}\n"
+                    "Use view_file to read the full file before retrying."
                 )
 
+            # Backup before modifying.
+            _backup_file(abs_path, "edit_file")
             new_content = (
                 "".join(lines[:match_start])
                 + replace
@@ -278,7 +374,10 @@ def grep_search(pattern: str, path: str = ".") -> str:
             break
 
     if not results:
-        return "No matches found."
+        return (
+            f"No matches found for pattern '{pattern}'."
+            " Try a simpler or broader pattern, or check the search path."
+        )
 
     output = "\n".join(results)
     if truncated:
@@ -317,6 +416,18 @@ def run_command(cmd: str) -> str:
             if len(stderr) > 5_000:
                 stderr = stderr[:5_000] + "\n... (stderr truncated)"
             parts.append(f"Stderr:\n{stderr}")
+
+            # Self-correcting hints for common errors.
+            stderr_lower = stderr.lower()
+            if "command not found" in stderr_lower or "not found" in stderr_lower:
+                parts.append(
+                    "Hint: The command was not found. "
+                    "Check if the tool is installed, or try installing it first."
+                )
+            elif "permission denied" in stderr_lower:
+                parts.append(
+                    "Hint: Permission denied. Try prefixing the command with `sudo`."
+                )
 
         if not res.stdout and not res.stderr:
             parts.append("(no output)")
