@@ -50,9 +50,9 @@ if [ -f "ronnie.py" ]; then
 else
     # Remote install from Git archive (does not require git binary)
     SRC_ZIP="https://github.com/RonnieAkagami/ronnie-cli/archive/refs/heads/main.zip"
-    if python3 -m pip install --upgrade "$SRC_ZIP" --break-system-packages 2>/dev/null; then
+    if python3 -m pip install --upgrade --no-cache-dir "$SRC_ZIP" --break-system-packages 2>/dev/null; then
         echo "[+] Package and dependencies installed globally from GitHub."
-    elif python3 -m pip install --upgrade "$SRC_ZIP" --user 2>/dev/null; then
+    elif python3 -m pip install --upgrade --no-cache-dir "$SRC_ZIP" --user 2>/dev/null; then
         echo "[+] Package and dependencies installed in user space from GitHub."
     else
         echo "[!] Warning: Failed to install package via pip. You may need to run 'pip install' manually."
