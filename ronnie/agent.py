@@ -25,6 +25,7 @@ from ronnie.config import (
     MAX_ITERATIONS,
     CONTEXT_MAX_MESSAGES,
     MAX_TOOL_OUTPUT_CHARS,
+    BELL_ENABLED,
 )
 from ronnie.tools import list_dir, view_file, write_file, edit_file, grep_search, run_command
 
@@ -183,7 +184,7 @@ def execute_tool(
             always_approve = True
 
     # ------ Execute ------
-    console.print(f"⚙️  [info]Executing {name}...[/info]")
+    _print_tool_label(name, args)
 
     try:
         if name == "list_dir":
@@ -227,6 +228,29 @@ def _tool_resp(name: str, status: str, message: str) -> str:
         f"</tool_response>"
     )
 
+
+# Tool name → (icon, arg_key for display)
+_TOOL_ICONS: dict[str, tuple[str, str | None]] = {
+    "list_dir":     ("📂", "path"),
+    "view_file":    ("👁 ", "path"),
+    "write_file":   ("📝", "path"),
+    "edit_file":    ("✏️ ", "path"),
+    "grep_search":  ("🔍", "pattern"),
+    "run_command":  ("▶ ", "cmd"),
+}
+
+
+def _print_tool_label(name: str, args: Dict[str, Any]) -> None:
+    """Print a compact, icon-prefixed tool label with the key argument."""
+    icon, arg_key = _TOOL_ICONS.get(name, ("⚙️ ", None))
+    detail = ""
+    if arg_key and arg_key in args:
+        val = args[arg_key]
+        # Truncate long values (e.g. file content, long commands).
+        if len(val) > 60:
+            val = val[:57] + "..."
+        detail = f" [bold]{val}[/bold]"
+    console.print(f"  {icon} [info]{name}[/info]{detail}")
 
 def _show_write_diff(args: Dict[str, Any]) -> None:
     path = args.get("path", "")
@@ -398,6 +422,7 @@ def run_agentic_loop(messages: List[Dict[str, str]], client: ollama.Client) -> b
         iteration += 1
         response_text = ""
         loop_start = time.monotonic()
+        interrupted = False
 
         try:
             # --- Spinner setup ---
@@ -440,46 +465,70 @@ def run_agentic_loop(messages: List[Dict[str, str]], client: ollama.Client) -> b
 
                 # --- Stream chunks, hiding raw XML tool calls ---
                 in_tool_call = False
-                last_chunk = None  # Track final chunk for token stats.
+                last_chunk = None
+                first_token = True
 
-                for chunk in stream_iter:
-                    last_chunk = chunk
-                    content = chunk.get("message", {}).get("content", "") or ""
-                    if not content:
-                        continue
+                try:
+                    for chunk in stream_iter:
+                        last_chunk = chunk
+                        content = chunk.get("message", {}).get("content", "") or ""
+                        if not content:
+                            continue
 
-                    if thinking:
-                        thinking = False
-                        t.join(timeout=1.0)
+                        if thinking:
+                            thinking = False
+                            t.join(timeout=1.0)
 
-                    response_text += content
+                        # Response header on first content token.
+                        if first_token:
+                            first_token = False
+                            live.update(Text("─── Ronnie ───", style="dim"))
+                            console.print()
 
-                    # Check if we've entered a tool call block.
-                    tool_start = response_text.find("<tool_call")
-                    if tool_start != -1:
-                        in_tool_call = True
-                        prose = response_text[:tool_start].strip()
-                        if prose:
-                            live.update(Markdown(prose))
-                        break
-                    else:
-                        live.update(Markdown(response_text.strip()))
+                        response_text += content
 
-                if thinking:
+                        # Check if we've entered a tool call block.
+                        tool_start = response_text.find("<tool_call")
+                        if tool_start != -1:
+                            in_tool_call = True
+                            prose = response_text[:tool_start].strip()
+                            if prose:
+                                live.update(Markdown(prose))
+                            break
+                        else:
+                            live.update(Markdown(response_text.strip()))
+                except KeyboardInterrupt:
+                    # Graceful Ctrl+C during streaming.
                     thinking = False
                     t.join(timeout=1.0)
+                    interrupted = True
+
+                if not interrupted and thinking:
+                    thinking = False
+                    t.join(timeout=1.0)
+
+            # Handle interruption cleanly.
+            if interrupted:
+                console.print("\n[warning]  ⏹  Generation interrupted.[/warning]")
+                # Don't add partial response to history — return to prompt.
+                return False
 
             # If we broke out of the Live context because of a tool call,
             # consume the rest of the stream silently.
             if in_tool_call:
-                console.print("[info]⚙️  Formulating tool call(s)...[/info]")
-                for chunk in stream_iter:
-                    last_chunk = chunk
-                    content = chunk.get("message", {}).get("content", "") or ""
-                    response_text += content
+                console.print("[info]  ⚙️  Formulating tool call(s)...[/info]")
+                try:
+                    for chunk in stream_iter:
+                        last_chunk = chunk
+                        content = chunk.get("message", {}).get("content", "") or ""
+                        response_text += content
+                except KeyboardInterrupt:
+                    console.print("\n[warning]  ⏹  Generation interrupted.[/warning]")
+                    return False
 
         except KeyboardInterrupt:
-            raise  # Let the CLI handle it.
+            console.print("\n[warning]  ⏹  Generation interrupted.[/warning]")
+            return False
         except Exception as e:
             console.print(f"\n[danger]Ollama error:[/danger] {e}")
             return False
@@ -564,5 +613,9 @@ def run_agentic_loop(messages: List[Dict[str, str]], client: ollama.Client) -> b
             f"[warning]⚠ Agent reached the iteration limit ({MAX_ITERATIONS}). "
             "Stopping to avoid an infinite loop.[/warning]"
         )
+
+    # Bell notification when the agent finishes.
+    if BELL_ENABLED:
+        print("\a", end="", flush=True)
 
     return True

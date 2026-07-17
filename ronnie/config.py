@@ -32,6 +32,12 @@ COMMAND_TIMEOUT: int = 300  # seconds
 OS_NAME: str = platform.system()  # "Darwin", "Linux", "Windows"
 
 # ---------------------------------------------------------------------------
+# UX preferences
+# ---------------------------------------------------------------------------
+# Ring terminal bell when the agent finishes a task (set RONNIE_BELL=0 to mute).
+BELL_ENABLED: bool = os.environ.get("RONNIE_BELL", "1") != "0"
+
+# ---------------------------------------------------------------------------
 # Rich theme & console
 # ---------------------------------------------------------------------------
 custom_theme = Theme({

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 import readline
 import atexit
 import threading
@@ -16,7 +17,7 @@ from rich.prompt import Prompt
 from ronnie.config import console, MODEL_NAME, history_file
 from ronnie.prompts import build_system_prompt
 from ronnie.agent import run_agentic_loop, session_tokens, _fmt_tokens
-from ronnie.tools import undo_last, undo_stack_depth
+from ronnie.tools import undo_last, undo_stack_depth, get_session_changes, clear_session_changes
 
 # ---------------------------------------------------------------------------
 # CLI history
@@ -152,17 +153,76 @@ def _check_and_update_bg() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Multiline input helper
+# ---------------------------------------------------------------------------
+
+def _read_multiline(prompt_str: str) -> str:
+    """Read user input with support for multiline mode.
+
+    - Type ``\"\"\"`` to enter multiline mode; type ``\"\"\"`` again to submit.
+    - End a line with ``\\`` to continue on the next line.
+    """
+    first_line = Prompt.ask(prompt_str)
+    first_line_stripped = first_line.strip()
+
+    # --- Triple-quote multiline mode ---
+    if first_line_stripped == '"""':
+        lines: list[str] = []
+        console.print("[dim]  (multiline mode — type \"\"\" on its own line to submit)[/dim]")
+        while True:
+            try:
+                line = Prompt.ask("[dim]  ...[/dim]")
+            except (KeyboardInterrupt, EOFError):
+                break
+            if line.strip() == '"""':
+                break
+            lines.append(line)
+        return "\n".join(lines)
+
+    # --- Backslash continuation ---
+    if first_line_stripped.endswith("\\"):
+        lines = [first_line_stripped[:-1]]
+        while True:
+            try:
+                line = Prompt.ask("[dim]  ...[/dim]")
+            except (KeyboardInterrupt, EOFError):
+                break
+            stripped = line.rstrip()
+            if stripped.endswith("\\"):
+                lines.append(stripped[:-1])
+            else:
+                lines.append(stripped)
+                break
+        return " ".join(lines)
+
+    return first_line
+
+
+# ---------------------------------------------------------------------------
+# Session user message history (for /history)
+# ---------------------------------------------------------------------------
+
+_user_messages: list[str] = []
+
+
+# ---------------------------------------------------------------------------
 # Slash commands
 # ---------------------------------------------------------------------------
 
 _HELP_TEXT = """\
 [bold cyan]Available Commands[/bold cyan]
-  [bold yellow]/clear[/bold yellow]    Clear conversation history
-  [bold yellow]/undo[/bold yellow]     Undo the last file modification
-  [bold yellow]/tokens[/bold yellow]   Show session token usage
-  [bold yellow]/help[/bold yellow]     Show this help message
-  [bold yellow]/model[/bold yellow]    Show the current model name
-  [bold yellow]/exit[/bold yellow]     Exit Ronnie (also: /quit)
+  [bold yellow]/clear[/bold yellow]     Clear conversation history
+  [bold yellow]/undo[/bold yellow]      Undo the last file modification
+  [bold yellow]/diff[/bold yellow]      Show all file changes this session
+  [bold yellow]/history[/bold yellow]   Show conversation history
+  [bold yellow]/tokens[/bold yellow]    Show session token usage
+  [bold yellow]/help[/bold yellow]      Show this help message
+  [bold yellow]/model[/bold yellow]     Show the current model name
+  [bold yellow]/exit[/bold yellow]      Exit Ronnie (also: /quit)
+
+[bold cyan]Input Modes[/bold cyan]
+  [dim]Type[/dim] [bold yellow]\"\"\"[/bold yellow] [dim]to enter multiline mode (close with another[/dim] [bold yellow]\"\"\"[/bold yellow][dim])[/dim]
+  [dim]End a line with[/dim] [bold yellow]\\\\[/bold yellow] [dim]to continue on the next line[/dim]
 """
 
 
@@ -173,6 +233,13 @@ def _handle_slash_command(
     lower = cmd.lower()
 
     if lower in ("/exit", "/quit", "exit", "quit"):
+        # Show session summary on exit.
+        if session_tokens.total > 0:
+            console.print(
+                f"[dim]Session: {_fmt_tokens(session_tokens.total)} tokens "
+                f"({_fmt_tokens(session_tokens.prompt_tokens)} in, "
+                f"{_fmt_tokens(session_tokens.completion_tokens)} out)[/dim]"
+            )
         console.print("[info]Goodbye![/info]")
         raise SystemExit(0)
 
@@ -180,7 +247,9 @@ def _handle_slash_command(
         messages.clear()
         messages.append({"role": "system", "content": system_prompt})
         session_tokens.reset()
-        console.print("[success]Conversation history cleared. Token counter reset.[/success]")
+        _user_messages.clear()
+        clear_session_changes()
+        console.print("[success]Conversation cleared. Tokens & history reset.[/success]")
         return True
 
     if lower == "/help":
@@ -215,6 +284,44 @@ def _handle_slash_command(
             )
         return True
 
+    if lower == "/diff":
+        changes = get_session_changes()
+        if not changes:
+            console.print("[dim]No file changes in this session.[/dim]")
+        else:
+            # Group by file path, count operations.
+            from collections import Counter
+            file_ops: dict[str, list[str]] = {}
+            for c in changes:
+                file_ops.setdefault(c.path, []).append(c.operation)
+
+            console.print(f"[bold cyan]Session Changes[/bold cyan] ({len(changes)} operation{'s' if len(changes) != 1 else ''}):")
+            for path, ops in file_ops.items():
+                created = ops.count("created")
+                modified = ops.count("modified")
+                if created:
+                    icon = "📝"
+                    detail = "Created"
+                elif modified > 1:
+                    icon = "✏️ "
+                    detail = f"Modified ({modified} edits)"
+                else:
+                    icon = "✏️ "
+                    detail = "Modified"
+                console.print(f"  {icon} [bold]{path}[/bold] — {detail}")
+        return True
+
+    if lower == "/history":
+        if not _user_messages:
+            console.print("[dim]No messages yet in this session.[/dim]")
+        else:
+            console.print("[bold cyan]Conversation History[/bold cyan]")
+            for i, msg in enumerate(_user_messages, start=1):
+                # Truncate long messages for display.
+                display = msg if len(msg) <= 80 else msg[:77] + "..."
+                console.print(f"  [dim]{i}.[/dim] {display}")
+        return True
+
     return False
 
 
@@ -233,11 +340,13 @@ _BANNER = """\
 [bold cyan]Ronnie CLI — Local Agentic Coding Partner[/bold cyan]
 Powered by [bold magenta]{model}[/bold magenta]
 
-Commands: [bold yellow]/help[/bold yellow] · [bold yellow]/clear[/bold yellow] · [bold yellow]/undo[/bold yellow] · [bold yellow]/exit[/bold yellow]
+Commands: [bold yellow]/help[/bold yellow] · [bold yellow]/clear[/bold yellow] · [bold yellow]/undo[/bold yellow] · [bold yellow]/diff[/bold yellow] · [bold yellow]/exit[/bold yellow]
 """
 
 
 def main() -> None:
+    _start = time.monotonic()
+
     # Fire auto-update in background so the CLI appears instantly.
     update_thread = threading.Thread(target=_check_and_update_bg, daemon=True)
     update_thread.start()
@@ -258,8 +367,11 @@ def main() -> None:
         )
         sys.exit(1)
 
-    # Banner.
-    console.print(Panel(_BANNER.format(model=MODEL_NAME), border_style="bright_magenta"))
+    # Banner + startup time.
+    startup_ms = (time.monotonic() - _start) * 1000
+    banner = _BANNER.format(model=MODEL_NAME)
+    console.print(Panel(banner, border_style="bright_magenta"))
+    console.print(f"[dim]  Ready in {startup_ms:.0f}ms · Type [bold yellow]\"\"\"[/bold yellow] for multiline input[/dim]")
 
     # Build system prompt with CWD + project context injected.
     cwd = os.getcwd()
@@ -278,7 +390,7 @@ def main() -> None:
     short_cwd = os.path.basename(cwd) or cwd
     while True:
         try:
-            user_input = Prompt.ask(f"\n[bold cyan]ronnie[/bold cyan] [dim]{short_cwd}[/dim]")
+            user_input = _read_multiline(f"\n[bold cyan]ronnie[/bold cyan] [dim]{short_cwd}[/dim]")
             user_input = user_input.strip()
             if not user_input:
                 continue
@@ -287,12 +399,15 @@ def main() -> None:
             if _handle_slash_command(user_input, messages, system_prompt):
                 continue
 
+            # Track user message for /history.
+            _user_messages.append(user_input)
+
             # Normal user message → agent.
             messages.append({"role": "user", "content": user_input})
             run_agentic_loop(messages, client)
 
         except KeyboardInterrupt:
-            console.print("\n[warning]KeyboardInterrupt. Type /exit to exit.[/warning]")
+            console.print("\n[warning]Interrupted. Type /exit to exit.[/warning]")
         except SystemExit:
             break
         except EOFError:

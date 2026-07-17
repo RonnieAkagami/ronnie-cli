@@ -95,6 +95,36 @@ def undo_stack_depth() -> int:
 
 
 # ---------------------------------------------------------------------------
+# Session change log (for /diff command)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _FileChange:
+    """Record of a single file modification."""
+    path: str        # relative path
+    operation: str   # "created", "modified", "overwritten"
+
+_session_changes: list[_FileChange] = []
+
+
+def _record_change(abs_path: str, was_new: bool, operation: str) -> None:
+    """Record a file change in the session log."""
+    rel = os.path.relpath(abs_path)
+    op = "created" if was_new else "modified"
+    _session_changes.append(_FileChange(path=rel, operation=op))
+
+
+def get_session_changes() -> list[_FileChange]:
+    """Return all file changes made in this session."""
+    return list(_session_changes)
+
+
+def clear_session_changes() -> None:
+    """Clear the session change log."""
+    _session_changes.clear()
+
+
+# ---------------------------------------------------------------------------
 # list_dir
 # ---------------------------------------------------------------------------
 
@@ -230,10 +260,12 @@ def write_file(path: str, content: str) -> str:
             os.makedirs(parent, exist_ok=True)
 
         # Backup before writing.
+        was_new = not os.path.exists(abs_path)
         _backup_file(abs_path, "write_file")
 
         with open(abs_path, "w", encoding="utf-8") as f:
             f.write(content)
+        _record_change(abs_path, was_new, "write_file")
         line_count = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
         return f"Success: Wrote {line_count} lines to '{path}'."
     except PermissionError:
@@ -280,6 +312,7 @@ def edit_file(path: str, search: str, replace: str) -> str:
             # Backup before modifying.
             _backup_file(abs_path, "edit_file")
             new_content = content.replace(search, replace, 1)
+            _record_change(abs_path, False, "edit_file")
         else:
             # --- Whitespace-normalised fallback ---
             norm_search = _normalize_ws(search)
@@ -314,6 +347,7 @@ def edit_file(path: str, search: str, replace: str) -> str:
 
             # Backup before modifying.
             _backup_file(abs_path, "edit_file")
+            _record_change(abs_path, False, "edit_file")
             new_content = (
                 "".join(lines[:match_start])
                 + replace
