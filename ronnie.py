@@ -6,6 +6,7 @@ import sys
 # without installation.
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
+#inport the main function.
 from ronnie.cli import main
 
 if __name__ == "__main__":
