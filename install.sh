@@ -55,7 +55,7 @@ else
     elif python3 -m pip install --upgrade --no-cache-dir "$SRC_ZIP" --user 2>/dev/null; then
         echo "[+] Package and dependencies installed in user space from GitHub."
     else
-        echo "[!] Warning: Failed to install package via pip. You may need to run 'pip install' manually."
+        echo "[!] Warning: Failed to install package via pip. You may need to run 'pip install' manually." #fail check
     fi
 fi
 
